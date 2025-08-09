@@ -109,3 +109,10 @@ if [[ "$remote_login_enabled" == "On" ]] || [[ "$has_dropbox_lan" == "yes" ]] ||
 else
   echo "✅  System appears secure. No obvious security issues found."
 fi
+
+
+echo "Success"
+
+exit 0
+
+
