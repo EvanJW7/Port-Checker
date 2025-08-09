@@ -110,7 +110,7 @@ else
   echo "✅  System appears secure. No obvious security issues found."
 fi
 
-
+echo
 echo "Success"
 
 exit 0
