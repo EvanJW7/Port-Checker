@@ -1,5 +1,19 @@
 #!/bin/bash
 
+get_remote_login_status() {
+  # Best-effort, passwordless check using launchctl instead of sudo systemsetup
+  if launchctl print system/com.openssh.sshd 2>/dev/null | grep -q "active = true"; then
+    echo "On"
+  else
+    echo "Off"
+  fi
+}
+
+has_nonapple_network_visible="no"
+has_remote_access_tools="no"
+has_third_party_startup="no"
+has_pending_updates="no"
+
 describe_port() {
   local process="$1"
   local port="$2"
@@ -27,9 +41,6 @@ describe_port() {
       ;;
     *:443)
       echo "HTTPS web server"
-      ;;
-    *:17500|*:17600|*:17603)
-      echo "Dropbox LAN sync"
       ;;
     *)
       if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 49152 )); then
@@ -82,7 +93,7 @@ echo
 echo "🛡️ Remote Management Check:"
 if pgrep remoted >/dev/null; then
   # Check if Remote Login is actually enabled
-  remote_login_status=$(sudo systemsetup -getremotelogin 2>/dev/null | grep -o "On\|Off")
+  remote_login_status=$(get_remote_login_status)
   if [[ "$remote_login_status" == "On" ]]; then
     echo "⚠️ 'remoted' is running AND Remote Login is ENABLED — Security risk!"
   else
@@ -93,33 +104,9 @@ else
 fi
 echo
 
-# 3. Check for Dropbox LAN sync (multiple known ports)
-echo "📦 Dropbox LAN Sync Check:"
-dropbox_ports="17500 17600 17603"
-dropbox_found=false
-for port in $dropbox_ports; do
-  if lsof -iTCP:$port -sTCP:LISTEN >/dev/null; then
-    echo "⚠️ Dropbox LAN sync port ($port) is open"
-    dropbox_found=true
-  fi
-done
-
-# Also check for any Dropbox processes with listening ports
-dropbox_listeners=$(lsof -i -P -n | grep LISTEN | grep -i dropbox)
-if [[ -n "$dropbox_listeners" ]]; then
-  echo "⚠️ Dropbox processes with listening ports found:"
-  echo "$dropbox_listeners"
-  dropbox_found=true
-fi
-
-if [[ "$dropbox_found" == false ]]; then
-  echo "✅ Dropbox LAN sync ports not open"
-fi
-echo
-
-# 4. Check key macOS sharing services
+# 3. Check key macOS sharing services
 echo "📡 Sharing Services:"
-remote_login_pref=$(sudo systemsetup -getremotelogin 2>/dev/null | grep -o "On\|Off")
+remote_login_pref=$(get_remote_login_status)
 screen_sharing_pref=$(launchctl print system/com.apple.screensharing 2>/dev/null | grep -q "enabled = 1" && echo "On" || echo "Off")
 file_sharing_pref=$(sharing -l 2>/dev/null | grep -q "File Sharing" && echo "On" || echo "Off")
 
@@ -175,27 +162,176 @@ fi
 rm -f /tmp/ports_watchdog_java_listeners.$$ 2>/dev/null
 echo
 
+# 7. Highlight network-visible non-Apple services
+echo "🌐 Network-visible Non-Apple Services:"
+tmp_nv=/tmp/ports_watchdog_network_visible.$$
+lsof -i -P -n | grep LISTEN > "$tmp_nv" 2>/dev/null
+
+tmp_nv_filtered=/tmp/ports_watchdog_network_visible_filtered.$$
+> "$tmp_nv_filtered"
+
+while IFS= read -r line; do
+  process=$(awk '{print $1}' <<< "$line")
+  address_port=$(grep -oE '[0-9a-fA-F\.:]+:[0-9]+' <<< "$line" | tail -n 1)
+  bind_addr="${address_port%:*}"
+
+  # Only care about services bound to all interfaces / network-visible
+  if [[ "$bind_addr" != "0.0.0.0" && "$bind_addr" != "*" && "$bind_addr" != "::" ]]; then
+    continue
+  fi
+
+  # Skip common Apple/system daemons
+  case "$process" in
+    rapportd|mDNSResponder|configd|socketfilterfw|apsd|trustd|softwareupdated|powerd|UserEventAgent|opendirectoryd|syslogd)
+      continue
+      ;;
+  esac
+
+  echo "$line" >> "$tmp_nv_filtered"
+done < "$tmp_nv"
+
+if [[ -s "$tmp_nv_filtered" ]]; then
+  has_nonapple_network_visible="yes"
+  cat "$tmp_nv_filtered"
+  echo "⚠️ Review the above apps; they are reachable from other devices on your network."
+else
+  echo "✅ No obvious third-party services listening on all interfaces."
+fi
+
+rm -f "$tmp_nv" "$tmp_nv_filtered" 2>/dev/null
+echo
+
+# 8. Check for common remote-access tools
+echo "🖥️ Remote Access Tools Check:"
+remote_tools=("TeamViewer" "teamviewerd" "AnyDesk" "anydesk" "RustDesk" "rustdesk" "LogMeIn" "logmein" "Splashtop" "splashtop" "Parsec" "parsecd" "Chrome Remote Desktop" "remotedesktop" "VNC" "Screen Sharing")
+remote_found=false
+
+for name in "${remote_tools[@]}"; do
+  if pgrep -fi "$name" >/dev/null 2>&1; then
+    if [[ "$remote_found" == false ]]; then
+      echo "⚠️ The following remote-access related processes are running:"
+      echo "   These tools can provide full or partial remote control of your Mac over the network."
+    fi
+    remote_found=true
+    has_remote_access_tools="yes"
+
+    # Show details for each matching process
+    pgrep -fl "$name" 2>/dev/null | while read -r line; do
+      pid=${line%% *}
+      cmd=${line#* }
+      app_path=$(grep -oE '/Applications/[^ ]+\.app' <<< "$cmd" | head -n 1)
+
+      # Human-friendly description based on the tool name
+      desc=""
+      case "$name" in
+        TeamViewer|teamviewerd)
+          desc="TeamViewer: remote support/remote desktop app that allows full remote control when signed in or when a session is started."
+          ;;
+        AnyDesk|anydesk)
+          desc="AnyDesk: remote desktop tool for unattended access and screen control over the internet."
+          ;;
+        RustDesk|rustdesk)
+          desc="RustDesk: open-source remote desktop application that can use public or self-hosted relay servers."
+          ;;
+        LogMeIn|logmein)
+          desc="LogMeIn: remote access software for persistent remote control of this machine."
+          ;;
+        Splashtop|splashtop)
+          desc="Splashtop: remote desktop/remote support tool used to access this Mac from other devices."
+          ;;
+        Parsec|parsecd)
+          desc="Parsec: high-performance remote streaming app, often used for gaming or low-latency remote desktops."
+          ;;
+        "Chrome Remote Desktop"|remotedesktop)
+          desc="Chrome Remote Desktop: Google remote access extension/service for sharing this Mac's screen via a Google account."
+          ;;
+        VNC|"Screen Sharing")
+          desc="VNC/Screen Sharing: built-in or third-party screen sharing service that allows remote viewing/control."
+          ;;
+      esac
+
+      echo "$line"
+      if [[ -n "$app_path" ]]; then
+        echo "    → App bundle: $app_path"
+      fi
+      if [[ -n "$desc" ]]; then
+        echo "    → Description: $desc"
+      else
+        echo "    → Description: Remote-access or screen-sharing related process; review its settings or uninstall if not needed."
+      fi
+    done
+  fi
+done
+
+if [[ "$remote_found" == false ]]; then
+  echo "✅ No common remote-access tools detected as running (TeamViewer, AnyDesk, RustDesk, etc.)."
+fi
+echo
+
+# 9. Startup & background items overview
+echo "🧩 Startup & Background Items:"
+for dir in "$HOME/Library/LaunchAgents" "/Library/LaunchAgents" "/Library/LaunchDaemons"; do
+  if [[ -d "$dir" ]]; then
+    count=$(ls "$dir" 2>/dev/null | wc -l | tr -d ' ')
+    echo "$dir: $count items"
+    echo "  (Each .plist here is a launch agent/daemon that can start automatically in the background.)"
+
+    ls "$dir" 2>/dev/null | head -n 10 | while read -r item; do
+      if [[ -z "$item" ]]; then
+        continue
+      fi
+      if [[ "$item" == com.apple.* ]]; then
+        kind="Apple/system"
+      else
+        kind="Third-party"
+        has_third_party_startup="yes"
+      fi
+      echo "  - $item ($kind launch item; installed and managed by its corresponding app/service)"
+    done
+
+    if (( count > 10 )); then
+      echo "… (showing first 10)"
+    fi
+    echo
+  fi
+done
+echo "ℹ️ Review third-party items above; they can run at login or in the background."
+echo
+
+# 10. Browser & extensions reminder
+echo "🌐 Browser & Extensions Reminder:"
+echo "• Periodically review installed browser extensions and remove ones you don't fully trust or use."
+echo "• Ensure your main browser profile is protected by a strong account password and two-factor authentication."
+echo
+
+# 11. macOS update status
+echo "🧱 macOS Update Status:"
+if updates_output=$(softwareupdate -l 2>/dev/null); then
+  if grep -q "No new software available." <<< "$updates_output"; then
+    echo "✅ No pending macOS software updates reported."
+  else
+    has_pending_updates="yes"
+    echo "⚠️ macOS reports available updates:"
+    echo "$updates_output"
+  fi
+else
+  echo "⚠️ Could not determine update status (softwareupdate command failed)."
+fi
+echo "ℹ️ Also ensure App Store apps (including Xcode) are up to date via the App Store."
+echo
+
 echo "===== END OF REPORT ====="
 echo
 
 # Overall safety assessment
 echo "🔒 OVERALL SAFETY ASSESSMENT:"
 
-remote_login_enabled=$(sudo systemsetup -getremotelogin 2>/dev/null | grep -o "On\|Off")
+remote_login_enabled=$(get_remote_login_status)
 # Re-evaluate firewall state for recommendations
 fw_cli_raw_assess=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null)
 fw_cli_state_assess=$(grep -oE 'State = [0-9]+' <<< "$fw_cli_raw_assess" 2>/dev/null | awk '{print $3}')
 fw_plist_state_assess=$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null || echo "")
 fw_state_assess="${fw_cli_state_assess:-$fw_plist_state_assess}"
-
-has_dropbox_lan=false
-for port in 17500 17600 17603; do
-  if lsof -iTCP:$port -sTCP:LISTEN >/dev/null; then
-    has_dropbox_lan=true
-    break
-  fi
-done
-has_dropbox_lan=$(if [[ "$has_dropbox_lan" == true ]]; then echo "yes"; else echo "no"; fi)
 
 # Only treat Java listeners as a concern if they are not local-only
 has_java_network_listeners=$(lsof -i -P -n | grep LISTEN | grep java | grep -Ev '127\.0\.0\.1:|::1:' >/dev/null && echo "yes" || echo "no")
@@ -205,7 +341,9 @@ if [[ "$fw_state_assess" == "0" || -z "$fw_state_assess" ]]; then
   firewall_is_off=true
 fi
 
-if [[ "$remote_login_enabled" == "On" ]] || [[ "$has_dropbox_lan" == "yes" ]] || [[ "$has_java_network_listeners" == "yes" ]] || [[ "$firewall_is_off" == true ]]; then
+if [[ "$remote_login_enabled" == "On" ]] || [[ "$has_java_network_listeners" == "yes" ]] || [[ "$firewall_is_off" == true ]] || \
+   [[ "$has_nonapple_network_visible" == "yes" ]] || [[ "$has_remote_access_tools" == "yes" ]] || \
+   [[ "$has_third_party_startup" == "yes" ]] || [[ "$has_pending_updates" == "yes" ]]; then
   echo "⚠️  CAUTION: Potential security concerns detected."
   echo
   echo "🔧 RECOMMENDED ACTIONS:"
@@ -213,11 +351,7 @@ if [[ "$remote_login_enabled" == "On" ]] || [[ "$has_dropbox_lan" == "yes" ]] ||
   if [[ "$remote_login_enabled" == "On" ]]; then
     echo "• Turn off Remote Login: System Preferences → Sharing → uncheck 'Remote Login'"
   fi
-  
-  if [[ "$has_dropbox_lan" == "yes" ]]; then
-    echo "• Disable Dropbox LAN sync: Dropbox → Preferences → Sync → uncheck 'Enable LAN sync'"
-  fi
-  
+
   if [[ "$has_java_network_listeners" == "yes" ]]; then
     echo "• Review Java applications: At least one Java process is listening on a network-visible interface; confirm you recognize and need it"
   fi
@@ -225,6 +359,22 @@ if [[ "$remote_login_enabled" == "On" ]] || [[ "$has_dropbox_lan" == "yes" ]] ||
   if [[ "$firewall_is_off" == true ]]; then
     echo "• Enable macOS Firewall: System Settings → Network → Firewall → Turn On"
   fi
+
+   if [[ "$has_nonapple_network_visible" == "yes" ]]; then
+     echo "• Review 'Network-visible Non-Apple Services' and disable or restrict any apps you don't recognize or actively use."
+   fi
+
+   if [[ "$has_remote_access_tools" == "yes" ]]; then
+     echo "• Review remote-access tools: keep only those you trust and need, and ensure they use strong passwords and two-factor authentication."
+   fi
+
+   if [[ "$has_third_party_startup" == "yes" ]]; then
+     echo "• Review third-party launch agents/daemons listed under 'Startup & Background Items' and remove or disable anything unnecessary."
+   fi
+
+   if [[ "$has_pending_updates" == "yes" ]]; then
+     echo "• Install pending macOS software updates and update App Store apps (including Xcode) via the App Store."
+   fi
 else
   echo "✅  System appears secure. No obvious security issues found."
 fi
