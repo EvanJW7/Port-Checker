@@ -52,7 +52,42 @@ describe_port() {
   esac
 }
 
-echo "===== PORT WATCHDOG REPORT ====="
+classify_expectation() {
+  local process="$1"
+  local port="$2"
+  local bind="$3"
+
+  # Known/expected Apple system services (often safe even if network-visible on local network)
+  case "$process" in
+    rapportd|ControlCe|ControlCenter|mDNSResponder|configd|apsd|trustd|softwareupdated|powerd|UserEventAgent|opendirectoryd|syslogd)
+      echo "✅ Expected (Apple system service)"
+      return
+      ;;
+  esac
+
+  # Local-only listeners are generally expected/low-risk
+  if [[ "$bind" == "127.0.0.1" || "$bind" == "::1" ]]; then
+    echo "✅ Expected (local-only listener; only this Mac can connect)"
+    return
+  fi
+
+  # SSH on standard port
+  if [[ "$port" == "22" ]]; then
+    echo "🟡 Depends (SSH open on network; expected only if you intentionally use Remote Login)"
+    return
+  fi
+
+  # Java used by bundled apps (like thinkorswim) is usually expected if you installed the app
+  if [[ "$process" == "java" || "$process" == "java-arm" ]]; then
+    echo "✅ Likely expected (Java app you installed; verify you recognize it)"
+    return
+  fi
+
+  # Anything else network-visible: be cautious
+  echo "🔴 Unexpected/Review (network-visible listener; confirm you recognize and need this app)"
+}
+
+echo "======================================== PORT WATCHDOG REPORT ========================================"
 echo
 
 # 1. Show all listening ports
@@ -76,6 +111,9 @@ lsof -i -P -n | grep LISTEN | while IFS= read -r line; do
   description=$(describe_port "$process" "$port" "$bind_addr")
   echo "$line"
   echo "    → $description"
+
+  expectation=$(classify_expectation "$process" "$port" "$bind_addr")
+  echo "    → $expectation"
 
   case "$scope" in
     local-only)
@@ -309,9 +347,13 @@ echo "🧱 macOS Update Status:"
 if updates_output=$(softwareupdate -l 2>/dev/null); then
   if grep -q "No new software available." <<< "$updates_output"; then
     echo "✅ No pending macOS software updates reported."
-  else
+  elif grep -qE '^\s*\* Label:' <<< "$updates_output"; then
     has_pending_updates="yes"
     echo "⚠️ macOS reports available updates:"
+    # Show only the label/title lines to keep output concise
+    echo "$updates_output" | grep -E '^\s*\* Label:|^\s*Title:'
+  else
+    echo "ℹ️ softwareupdate output did not clearly indicate pending updates:"
     echo "$updates_output"
   fi
 else
